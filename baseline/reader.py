@@ -35,7 +35,7 @@ def register_reader(cls, task, name=None):
         BASELINE_READERS[task] = {}
 
     if name in BASELINE_READERS[task]:
-        raise Exception('Error: attempt to re-defined previously registered handler {} for task {} in registry'.format(name, task))
+        logger.warning('Warning: attempting to re-defined previously registered handler {} for task {} in registry'.format(name, task))
 
     BASELINE_READERS[task][name] = cls
     return cls
@@ -799,12 +799,14 @@ class LineSeqLabelReader(SeqLabelReader):
             
                 example_dict['y'] = y
                 examples.append(example_dict)
+
+        return self.to_data_loader(examples, shuffle, sort_key, batchsz)
+
+    def to_data_loader(self, examples, shuffle, sort_key, batchsz):
         return baseline.data.ExampleDataFeed(baseline.data.DictExamples(examples,
                                                                         do_shuffle=shuffle,
                                                                         sort_key=sort_key),
                                              batchsz=batchsz, shuffle=shuffle, trim=self.trim, truncate=self.truncate)
-
-
 @export
 @register_reader(task='classify', name='default')
 class TSVSeqLabelReader(LineSeqLabelReader):
