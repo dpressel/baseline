@@ -1931,6 +1931,7 @@ class FineTuneModel(nn.Module):
             self.finetuned = EmbeddingsStack(embeddings)
         else:
             self.finetuned = embeddings
+        self.num_classes = nc
         self.stack_model = stack_model
         output_dim = self.finetuned.output_dim if stack_model is None else stack_model.output_dim
         self.output_layer = Dense(output_dim, nc, activation="log_softmax")
@@ -1988,6 +1989,7 @@ class EmbedPoolStackModel(nn.Module):
         self.stack_model = stack_model if stack_model else nn.Identity()
         output_dim = self.pool_model.output_dim if stack_model is None else stack_model.output_dim
         self.output_layer = Dense(output_dim, nc, activation="log_softmax") if output_model is None else output_model
+        self.num_classes = nc
 
     def forward(self, inputs: Dict[str, torch.Tensor]):
         lengths = inputs["lengths"]

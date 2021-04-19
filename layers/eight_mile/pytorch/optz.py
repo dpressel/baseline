@@ -222,6 +222,12 @@ class OptimizerManager:
                 if p.grad is not None:
                     p.grad.data.mul_(scalar)
 
+    def clip_grads(self, grad_clip):
+        for param_group in self.optimizer.param_groups:
+            for p in param_group['params']:
+                if p.grad is not None:
+                    p.grad.clamp_(-grad_clip, grad_clip)
+
     def zero_grad(self):
         self.optimizer.zero_grad()
 

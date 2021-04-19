@@ -31,6 +31,11 @@ class ConfusionMatrix:
         nc = len(self.labels)
         self._cm = np.zeros((nc, nc), dtype=np.int)
 
+    def update(self, cm):
+        if len(self.labels) != len(cm.labels):
+            raise Exception("Cannot update, confusion matrices don't match")
+        self._cm += cm._cm
+
     def add(self, truth, guess):
         """Add a single value to the confusion matrix based off `truth` and `guess`
 
