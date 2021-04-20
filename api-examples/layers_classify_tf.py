@@ -8,6 +8,7 @@ from eight_mile.tf.layers import SET_TRAIN_FLAG, set_tf_log_level, set_tf_eager_
 from eight_mile.tf.optz import EagerOptimizer
 set_tf_eager_mode(True)
 import tensorflow as tf
+import tensorflow as tf
 from tensorflow.compat.v1 import count_nonzero
 import logging
 import numpy as np

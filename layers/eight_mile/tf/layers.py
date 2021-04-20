@@ -125,8 +125,8 @@ def create_distribute_strategy(strategy_name, endpoint=None, num_gpus=-1):
         tf.config.experimental_connect_to_cluster(resolver)
         # This is the TPU initialization code that has to be at the beginning.
         tf.tpu.experimental.initialize_tpu_system(resolver)
-        for tpu in tf.config.list_logical_devices('TPU'):
-            LOGGER.info('Device [%s]', tpu.name)
+        for dev in tf.config.list_logical_devices('TPU'):
+            LOGGER.info('Device [%s]', dev.name)
         strategy = tf.distribute.experimental.TPUStrategy(resolver)
     else:
         if strategy_name == "nccl":
@@ -137,10 +137,16 @@ def create_distribute_strategy(strategy_name, endpoint=None, num_gpus=-1):
             devices = ['/device:GPU:{}'.format(i) for i in range(num_gpus)]
             strategy = tf.distribute.MirroredStrategy(devices)
         else:
-            raise Exception(f"Unsupported strategy {strategy_name}")
+            num_gpus = get_num_gpus_multiworker() if num_gpus < 1 else num_gpus
+            if num_gpus == 0:
+                LOGGER.warning("No GPUs found, this will be slow")
+                device = '/cpu:0'
+            else:
+                device = '/gpu:0'
+            strategy = tf.distribute.OneDeviceStrategy(device)
 
-        for tpu in tf.config.list_logical_devices('GPU'):
-            LOGGER.info('Device [%s]', tpu.name)
+        for dev in tf.config.list_logical_devices('GPU'):
+            LOGGER.info('Device [%s]', dev.name)
 
     patch_dist_strategy(strategy)
     return strategy
@@ -3301,6 +3307,7 @@ class EmbedPoolStackModel(tf.keras.Model):
         self.pool_model = pool_model
         self.stack_model = stack_model
         self.output_layer = tf.keras.layers.Dense(nc) if output_model is None else output_model
+        self.num_classes = nc
 
     def call(self, inputs):
         lengths = inputs.get("lengths")
@@ -3317,6 +3324,7 @@ class FineTuneModel(tf.keras.Model):
         self.finetuned = embeddings
         self.stack_model = stack_model
         self.output_layer = tf.keras.layers.Dense(nc)
+        self.num_classes = nc
 
     def call(self, inputs):
         base_layers = self.finetuned(inputs)

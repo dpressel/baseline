@@ -6,32 +6,28 @@ validation.
 
 
 """
-
-import torch
-import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel
+import tensorflow as tf
 import os
+import numpy as np
+import logging
+from copy import deepcopy
 from typing import Union
 from typing import Optional, Dict, List, Tuple
-from eight_mile.utils import listify
-from eight_mile.pytorch.optz import OptimizerManager
-from eight_mile.pytorch.layers import save_checkpoint, checkpoint_for, init_distributed
+from eight_mile.tf.layers import SET_TRAIN_FLAG, TRAIN_FLAG, create_distribute_strategy
+from eight_mile.tf.optz import OptimizerManager
 from eight_mile.progress import create_progress_bar
 from eight_mile.confusion import ConfusionMatrix
-from eight_mile.utils import Average, get_num_gpus_multiworker
+from eight_mile.utils import Average, get_num_gpus_multiworker, revlut, listify
 from contextlib import ExitStack
 from baseline.utils import get_metric_cmp
 from baseline.embeddings import *
-import logging
-
 logger = logging.getLogger(__file__)
 
 
-class TrainingTarget(nn.Module):
+class TrainingTarget(tf.keras.Model):
 
-    def __init__(self):
-        super().__init__()
-        self.device = 'cpu'
+    def __init__(self, name=None):
+        super().__init__(name=name)
 
     def train_step(self, batch, device):
         pass
@@ -42,10 +38,6 @@ class TrainingTarget(nn.Module):
     @property
     def model(self):
         pass
-
-    def set_device(self, device):
-        self.to(device=device)
-        self.device = device
 
 
 class GlobalMetrics:
@@ -71,14 +63,19 @@ class GlobalMetrics:
             if metric not in self.metrics:
                 if isinstance(local_metrics[metric], ConfusionMatrix):
                     self.metrics[metric] = ConfusionMatrix(local_metrics[metric].labels)
+                elif metric == 'confusion':
+                    self.metrics[metric] = ConfusionMatrix(np.arange(len(local_metrics[metric])))
                 else:
                     self.metrics[metric] = Average(metric)
 
-            self.metrics[metric].update(local_metrics[metric])
+            if isinstance(local_metrics[metric], tf.Tensor):
+                tensor = local_metrics[metric].numpy()
+            else:
+                tensor = local_metrics[metric]
+            self.metrics[metric].update(tensor)
 
     def __getitem__(self, item):
         return self.metrics[item]
-
 
     def __setitem__(self, key, value):
         self.metrics[key] = value
@@ -118,12 +115,15 @@ class SaveCheckpoint(MetricObserver):
     def __init__(self, checkpoint_dir, model_base='checkpoint'):
         self.checkpoint_dir = checkpoint_dir
         self.model_base = os.path.join(self.checkpoint_dir, model_base)
+        self.step2checkpoint = {}
 
     def run(self, model, metrics, global_step):
-        save_checkpoint(model, self.model_base, global_step, tick_type='step')
+        checkpoint = tf.train.Checkpoint(model=model)
+        fname = checkpoint.save(os.path.join(self.checkpoint_dir, self.model_base))
+        self.step2checkpoint[global_step] = fname
 
     def get_model_file(self, global_step):
-        return checkpoint_for(self.model_base, global_step, tick_type='step') + '.pth'
+        return self.step2checkpoint[global_step]
 
 
 class CheckpointManager(MetricObserver):
@@ -151,17 +151,9 @@ class CheckpointManager(MetricObserver):
             global_step = self.step
         return self.saver.get_model_file(global_step)
 
-    def restore(self, module, global_step=-1, str_map={}, map_location=None):
-        ckpt_dict = torch.load(self.get_model_file(global_step), map_location=map_location)
-        renamed = {}
-        for k, v in ckpt_dict.items():
-            for from_str, to_str in str_map.items():
-                k = k.replace(from_str, to_str)
-            renamed[k] = v
-        unmatch = module.load_state_dict(renamed, strict=False)
-        if unmatch.missing_keys or len(unmatch.unexpected_keys) > 2:
-            print("Warning: Embedding doesn't match with the checkpoint being loaded.")
-            print(f"missing keys: {unmatch.missing_keys}\n unexpected keys: {unmatch.unexpected_keys}")
+    def restore(self, module, global_step=-1):
+        checkpoint = tf.train.Checkpoint(model=module)
+        checkpoint.restore(self.get_model_file(global_step))
 
 
 class Trainer:
@@ -180,6 +172,8 @@ class Trainer:
             test_metric_observers: Union[List[MetricObserver], MetricObserver] = [],
             **kwargs):
         self.train_module = train_module
+        print('subs', self.train_module.submodules)
+        print('vars', self.train_module.variables)
         self.clip = clip
         self.optimizer = OptimizerManager(train_module, global_step, optim=optim, lr=lr, weight_decay=weight_decay)
         self.loss_key = loss_key
@@ -200,13 +194,16 @@ class Trainer:
             observer.run(self.train_module, metrics, self.optimizer.global_step)
 
     def run(self, train_loader, valid_loader=None, eval_loader=None, num_epochs: int = 1,
-            report_on: int = 100, grad_accum: int = 1,
+            report_on: int = 100,
             early_stopping_metric: str=None,
             local_rank=0,
             distributed=False,
             basedir: str=None,
-            device='cuda',
             max_steps_per_epoch=None,
+            strategy_type='mirror',
+            eval_device='/device:GPU:0',
+            endpoint=None,
+            num_gpus=1,
             progress_bar='default'):
 
         # Get the basedir to save results and checkpoints
@@ -216,16 +213,17 @@ class Trainer:
 
         # Setup logger
         logging.basicConfig(level=logging.INFO if local_rank in [-1, 0] else logging.WARN)
-        num_gpus = get_num_gpus_multiworker()
 
         distributed = distributed or num_gpus > 1
-        if distributed:
-            device, updated_local_rank = init_distributed(local_rank)
-            local_rank = updated_local_rank
-
         logger.info(f"Using {num_gpus} GPUs in this job.")
 
-        self.train_module.set_device(device)
+        if distributed and strategy_type == 'tpu':
+            eval_device = '/device:CPU:0'
+            num_gpus = 0
+
+        strategy = create_distribute_strategy(local_rank, endpoint, num_gpus)
+
+        eval_strategy = tf.distribute.OneDeviceStrategy(eval_device)
 
         checkpoint_manager = CheckpointManager(basedir, early_stopping_key=early_stopping_metric)
         self.valid_metric_observers.append(checkpoint_manager)
@@ -235,63 +233,74 @@ class Trainer:
         steps_eval = len(eval_loader) if eval_loader else 0
 
         if distributed:
-            train_module = DistributedDataParallel(self.train_module, device_ids=[device], output_device=device)
-        else:
-            train_module = self.train_module
+            train_loader = strategy.experimental_distribute_dataset(train_loader)
+
+        @tf.function
+        def distributed_train_step(inputs):
+
+            def _replicated_train_step(replicated_inputs):
+
+                with tf.GradientTape() as tape:
+                    metrics = self.train_module.train_step(replicated_inputs)
+                    loss = metrics[self.loss_key]
+                    self.optimizer.step(tape, loss)
+                return metrics
+            metrics = strategy.run(_replicated_train_step, args=(inputs,))
+            for metric in metrics:
+                metrics[metric] = strategy.reduce(tf.distribute.ReduceOp.SUM, metrics[metric], axis=None)
+            return metrics
+
+        @tf.function
+        def distributed_eval_step(inputs):
+            metrics = strategy.run(self.train_module.eval_step, args=(inputs,))
+            for metric in metrics:
+                metrics[metric] = strategy.reduce(tf.distribute.ReduceOp.SUM, metrics[metric], axis=None)
+            return metrics
 
         for epoch in range(num_epochs):
-            train_module.train()
-            steps = steps_train
-            if max_steps_per_epoch and max_steps_per_epoch < steps_train:
-                steps = max_steps_per_epoch
-            pg = create_progress_bar(steps, name=progress_bar)
-            epoch_train_metrics = GlobalMetrics()
-            last_report_step = -1
+            with strategy.scope():
+                SET_TRAIN_FLAG(True)
+                steps = steps_train
+                if max_steps_per_epoch and max_steps_per_epoch < steps_train:
+                    steps = max_steps_per_epoch
+                pg = create_progress_bar(steps, name=progress_bar)
+                epoch_train_metrics = GlobalMetrics()
+                last_report_step = -1
 
-            for iters, batch in enumerate(pg(train_loader)):
-                is_dist_step = iters % grad_accum == 0
-                with train_module.no_sync() if (distributed and not is_dist_step) else ExitStack():
-                    metrics = train_module.train_step(batch)
-                    loss = metrics[self.loss_key]
+                for iters, batch in enumerate(pg(train_loader)):
+                    metrics = distributed_train_step(batch)
                     epoch_train_metrics.update(metrics)
-                    loss.backward()
 
-                    if is_dist_step:
-                        if self.clip and self.clip > 0.0:
-                            self.optimizer.clip_grads(self.clip)
-                        self.optimizer.step()
-                        self.optimizer.zero_grad()
-                        if max_steps_per_epoch is not None and (iters / grad_accum) >= (max_steps_per_epoch-1):
-                            break
+                    if self.optimizer.global_step % report_on == 0:
+                        last_report_step = self.optimizer.global_step
+                        self._fire_train_observers(epoch_train_metrics.reduce())
 
-                        if self.optimizer.global_step % report_on == 0:
-                            last_report_step = self.optimizer.global_step
-                            self._fire_train_observers(epoch_train_metrics.reduce())
+                if steps_valid < 1 or local_rank > 0:
+                    continue
 
-            if steps_valid < 1 or local_rank > 0:
-                continue
+                if self.optimizer.global_step != last_report_step:
+                    self._fire_train_observers(epoch_train_metrics.reduce())
 
-            if self.optimizer.global_step != last_report_step:
-                self._fire_train_observers(epoch_train_metrics.reduce())
+                #with eval_strategy.scope():
 
-            train_module.eval()
-            pg = create_progress_bar(steps_valid)
-            epoch_valid_metrics = GlobalMetrics()
-            for batch in pg(valid_loader):
-                metrics = train_module.eval_step(batch)
-                epoch_valid_metrics.update(metrics)
-            self._fire_valid_observers(epoch_valid_metrics.reduce())
+                SET_TRAIN_FLAG(False)
+                pg = create_progress_bar(steps_valid)
+                epoch_valid_metrics = GlobalMetrics()
+                for batch in pg(valid_loader):
+                    metrics = distributed_eval_step(batch)
+                    epoch_valid_metrics.update(metrics)
+                self._fire_valid_observers(epoch_valid_metrics.reduce())
 
         if steps_eval < 1 or local_rank > 0:
             return
 
-        pg = create_progress_bar(steps_eval)
-        epoch_eval_metrics = GlobalMetrics()
+        with eval_strategy.scope():
+            pg = create_progress_bar(steps_eval)
+            epoch_eval_metrics = GlobalMetrics()
+            SET_TRAIN_FLAG(False)
+            checkpoint_manager.restore(self.train_module)
+            for batch in pg(eval_loader):
+                metrics = distributed_eval_step(batch)
+                epoch_eval_metrics.update(metrics)
 
-        checkpoint_manager.restore(train_module, map_location=device)
-        train_module.eval()
-        for batch in pg(eval_loader):
-            metrics = train_module.eval_step(batch)
-            epoch_eval_metrics.update(metrics)
-
-        self._fire_test_observers(epoch_eval_metrics.reduce())
+            self._fire_test_observers(epoch_eval_metrics.reduce())

@@ -808,3 +808,87 @@ class EagerOptimizer:
         grads, _ = tf.clip_by_global_norm(grads, self.clip)
         self.optimizer.apply_gradients(zip(grads, model.trainable_variables))
         return loss_value, h
+
+
+class OptimizerManager:
+    def __init__(self, model, global_step=0, **kwargs):
+        self.model = model
+        self.global_step = global_step
+        if "lr_function" in kwargs:
+            self.lr_function = kwargs["lr_function"]
+        else:
+            if "lr_scheduler_type" not in kwargs:
+                kwargs["lr_scheduler_type"] = "default"
+            self.lr_function = create_lr_scheduler(**kwargs)
+        self._init_optimizer(**kwargs)
+        self.current_lr = 0
+
+    @property
+    def global_step(self):
+        return self._global_step
+
+    @global_step.setter
+    def global_step(self, value):
+        self._global_step = value
+
+    def _init_optimizer(self, **kwargs):
+        lr_function = self.lr_function
+        optim = kwargs.get("optim", "sgd")
+        lr = kwargs.get("lr", kwargs.get("eta", 0.01))
+        sgd_mom = float(kwargs.get("mom", 0.9))
+        if optim == "adadelta":
+            rho = float(kwargs.get("rho", 0.95))
+            eps = float(kwargs.get("epsilon", 1e-6))
+            logger.info("adadelta(eta=%f, rho=%f, epsilon=%f)", lr, rho, eps)
+            self.optimizer = tf.keras.optimizers.Adadelta(lr_function, rho, eps)
+        elif optim == "adam":
+            beta1 = float(kwargs.get("beta1", 0.9))
+            beta2 = float(kwargs.get("beta2", 0.999))
+            eps = float(kwargs.get("epsilon", 1e-8))
+            logger.info("adam(eta=%f beta1=%f, beta2=%f, eps=%f)", lr, beta1, beta2, eps)
+            self.optimizer = tf.keras.optimizers.Adam(lr_function, beta1, beta2, eps)
+
+        elif optim == "adamw":
+            import tensorflow_addons as tfa
+            beta1 = float(kwargs.get("beta1", 0.9))
+            beta2 = float(kwargs.get("beta2", 0.999))
+            eps = float(kwargs.get("epsilon", 1e-8))
+            wd = float(kwargs.get("weight_decay", 0.0))
+            if wd == 0.0:
+                logger.info("adam(eta=%f beta1=%f, beta2=%f, eps=%f)", lr, beta1, beta2, eps)
+                self.optimizer = tf.keras.optimizers.Adam(lr_function, beta1, beta2, eps)
+            else:
+                def weight_decay_fn():
+                    wd_t = lr_function(tf.cast(self.global_step, tf.float32) / lr) * wd
+                    return wd_t
+                logger.info("adamw(eta=%f beta1=%f, beta2=%f, eps=%f, wd=%f)", lr, beta1, beta2, eps, wd)
+                self.optimizer = tfa.optimizers.AdamW(
+                    weight_decay=weight_decay_fn, learning_rate=lr_function, beta_1=beta1, beta_2=beta2, epsilon=eps
+                )
+        elif optim == "rmsprop":
+            # Get mom again with difference default
+            mom = float(kwargs.get("mom", 0.0))
+            logger.info("rmsprop(eta=%f, mom=%f)", lr, mom)
+            self.optimizer = tf.keras.optimizers.RMSprop(lr_function, momentum=mom)
+        elif sgd_mom > 0:
+            logger.info("sgd-mom(eta=%f, mom=%f)", lr, sgd_mom)
+            self.optimizer = tf.keras.optimizers.SGD(lr_function, sgd_mom)
+        else:
+            logger.info("sgd(eta=%f)", lr)
+            self.optimizer = tf.keras.optimizers.SGD(lr_function)
+
+    def _identity(self, _):
+        return self.current_lr
+
+    def step(self, tape, loss_value):
+        """Runs at every step and updates the learning rate
+
+        :return:
+        """
+        grads = tape.gradient(loss_value, self.model.trainable_variables)
+        # TODO grad accum?
+        # TODO, add me back
+        #grads, _ = tf.clip_by_global_norm(grads, self.clip)
+        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        self.global_step += 1
+

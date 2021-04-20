@@ -17,7 +17,7 @@ class ConfusionMatrix:
     Metrics are available that use the confusion matrix
     """
 
-    def __init__(self, labels):
+    def __init__(self, labels, cm = None):
         """Constructor with input labels
 
         :param labels: Either a dictionary (`k=int,v=str`) or an array of labels
@@ -29,12 +29,20 @@ class ConfusionMatrix:
         else:
             self.labels = labels
         nc = len(self.labels)
-        self._cm = np.zeros((nc, nc), dtype=np.int)
+        if cm is not None:
+            if len(cm) != len(self.labels):
+                raise Exception("Unexpected shape mismatch")
+            self._cm = cm
+        else:
+            self._cm = np.zeros((nc, nc), dtype=np.int)
 
     def update(self, cm):
-        if len(self.labels) != len(cm.labels):
-            raise Exception("Cannot update, confusion matrices don't match")
-        self._cm += cm._cm
+        if hasattr(cm, 'labels'):
+            if len(self.labels) != len(cm.labels):
+                raise Exception("Cannot update, confusion matrices don't match")
+            self._cm += cm._cm
+        else:
+            self._cm += cm
 
     def add(self, truth, guess):
         """Add a single value to the confusion matrix based off `truth` and `guess`
